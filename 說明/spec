@@ -109,4 +109,334 @@ term_c = coeff_c * frac * 64     // 補償精度
 
 **最重要的是**：你要理解這不只是功能實現，而是要考慮PPA（Performance, Power, Area）的平衡！每一行code都會變成真實的硬體資源！
 
-下次別只問怎麼註解，要問怎麼優化timing、怎麼減少面積、怎麼降低功耗！​​​​​​​​​​​​​​​​
+module Bicubic (
+input CLK,          // 系統時鐘
+input RST,          // 系統重置信號（高電平有效）
+input [6:0] V0,     // 起始垂直座標 (0-99)
+input [6:0] H0,     // 起始水平座標 (0-99)  
+input [4:0] SW,     // 源區域寬度（實際像素數-1）
+input [4:0] SH,     // 源區域高度（實際像素數-1）
+input [5:0] TW,     // 目標區域寬度（輸出像素數）
+input [5:0] TH,     // 目標區域高度（輸出像素數）
+output reg DONE     // 完成信號（高電平一個週期）
+);
+
+// ================= 記憶體介面信號 =================
+// ImgROM介面：存儲100x100源圖像，每像素8位
+wire [7:0] ImgROM_Q;        // ROM輸出數據
+reg ImgROM_CEN;             // ROM使能信號（低電平有效）
+reg [13:0] ImgROM_A;        // ROM地址（14位支持16K地址空間）
+
+// ResultSRAM介面：存儲輸出圖像
+wire [7:0] ResultSRAM_Q;    // SRAM輸出數據（本設計中未使用）
+reg ResultSRAM_CEN;         // SRAM使能信號（低電平有效）
+reg ResultSRAM_WEN;         // SRAM寫使能信號（低電平有效）
+reg [13:0] ResultSRAM_A;    // SRAM地址
+reg [7:0] ResultSRAM_D;     // SRAM輸入數據
+
+// ================= 狀態機定義 =================
+reg [2:0] current_state, next_state;
+parameter IDLE          = 3’d0,    // 空閒狀態，等待開始處理
+LOAD_PIXELS   = 3’d1,    // 讀取4x4像素區塊到緩衝區
+CALC_HORZ     = 3’d2,    // 計算水平方向插值（4次）
+CALC_VERT     = 3’d3,    // 計算垂直方向插值（1次）
+WRITE_RESULT  = 3’d4,    // 將結果寫入ResultSRAM
+DONE_STATE    = 3’d5;    // 處理完成狀態
+
+// ================= 計數器和控制信號 =================
+reg [4:0] load_counter;             // 像素讀取計數器（0-15）
+reg [2:0] calc_counter;             // 水平插值計算計數器（0-3）
+reg [15:0] output_counter;          // 輸出像素計數器
+wire [15:0] total_outputs;          // 總輸出像素數
+assign total_outputs = TW * TH;     // 計算總輸出像素數
+
+// ================= 座標計算模組 =================
+reg [5:0] output_x, output_y;       // 當前輸出像素的座標（目標圖像）
+
+// 座標映射：從目標圖像座標映射到源圖像座標
+// 使用定點數運算避免浮點除法，精度為1/8像素
+wire [9:0] src_x_scaled, src_y_scaled;  // 源圖像對應座標（8倍定點數）
+wire [6:0] src_x_int, src_y_int;        // 源圖像整數座標
+wire [2:0] frac_x, frac_y;              // 插值用的小數部分（0-7）
+
+// 座標映射公式：target_coord * (src_size-1) / (target_size-1)
+// 乘以8是為了保持精度，後續會右移3位
+assign src_x_scaled = (output_x * (SW - 1) * 8) / ((TW - 1) == 0 ? 1 : (TW - 1));
+assign src_y_scaled = (output_y * (SH - 1) * 8) / ((TH - 1) == 0 ? 1 : (TH - 1));
+
+// 分離整數和小數部分
+assign src_x_int = H0 + (src_x_scaled >> 3);   // 右移3位得到整數座標
+assign src_y_int = V0 + (src_y_scaled >> 3);
+assign frac_x = src_x_scaled[2:0];             // 取低3位作為小數部分
+assign frac_y = src_y_scaled[2:0];
+
+// ================= 像素緩衝區 =================
+reg [7:0] pixel_buffer [0:15];      // 4x4像素緩衝區，存儲當前處理的16個像素
+reg [2:0] buf_row, buf_col;         // 緩衝區行列索引
+
+// ================= 雙三次插值計算模組 =================
+// 插值用的四個點（有符號數，支持負值處理）
+reg signed [8:0] p_m1, p_0, p_1, p_2;  // p(-1), p(0), p(1), p(2)
+
+// 三次多項式係數：p(x) = ax³ + bx² + cx + d
+reg signed [10:0] coeff_a, coeff_b;     // a,b係數（較大範圍）
+reg signed [8:0] coeff_c, coeff_d;      // c,d係數
+reg signed [2:0] frac;                  // 當前使用的小數部分（0-7）
+
+// 插值結果（有符號16位，支持超出0-255範圍的中間結果）
+wire signed [15:0] interp_result;
+
+// 水平插值結果緩存（存儲4行的水平插值結果）
+reg [7:0] horz_results [0:3];
+
+// ================= 三次插值係數計算 =================
+// 根據四個控制點計算三次多項式係數
+// 使用標準bicubic插值公式
+always @(*) begin
+coeff_a = -p_m1 + 3*p_0 - 3*p_1 + p_2;    // -1*p(-1) + 3*p(0) - 3*p(1) + 1*p(2)
+coeff_b = 2*p_m1 - 5*p_0 + 4*p_1 - p_2;   //  2*p(-1) - 5*p(0) + 4*p(1) - 1*p(2)
+coeff_c = -p_m1 + p_1;                     // -1*p(-1) + 0*p(0) + 1*p(1) + 0*p(2)
+coeff_d = p_0;                             //  0*p(-1) + 1*p(0) + 0*p(1) + 0*p(2)
+end
+
+// ================= 多項式求值計算 =================
+// 計算 p(x) = ax³ + bx² + cx + d，其中x為0-7的定點數
+// 為了避免精度損失，各項都乘以適當的因子後再相加
+wire signed [18:0] term_a = coeff_a * frac * frac * frac;    // ax³項
+wire signed [15:0] term_b = coeff_b * frac * frac * 8;       // bx²項，乘8補償精度
+wire signed [12:0] term_c = coeff_c * frac * 64;             // cx項，乘64補償精度  
+wire signed [15:0] term_d = coeff_d * 512;                   // d項，乘512補償精度
+
+// 合併所有項並恢復正確的小數點位置（右移9位）
+assign interp_result = (term_a + term_b + term_c + term_d) >>> 9;
+
+// ================= 結果限制和四捨五入函數 =================
+// 將插值結果限制在0-255範圍內，並進行四捨五入
+function [7:0] clamp_round;
+input signed [15:0] value;
+begin
+if (value < 0)                          // 負值截斷為0
+clamp_round = 8’d0;
+else if (value > 255)                   // 超過255截斷為255
+clamp_round = 8’d255;
+else
+clamp_round = value[7:0];           // 正常範圍直接取低8位
+end
+endfunction
+
+// ================= 記憶體模組實例化 =================
+// 實例化圖像ROM，包含100x100源圖像
+ImgROM u_ImgROM (
+.Q(ImgROM_Q),           // 8位數據輸出
+.CLK(CLK),              // 時鐘信號
+.CEN(ImgROM_CEN),       // 使能信號（低電平有效）
+.A(ImgROM_A)            // 14位地址輸入
+);
+
+// 實例化結果SRAM，存儲處理後的圖像
+ResultSRAM u_ResultSRAM (
+.Q(ResultSRAM_Q),       // 8位數據輸出（本設計中未使用）
+.CLK(CLK),              // 時鐘信號
+.CEN(ResultSRAM_CEN),   // 使能信號（低電平有效）
+.WEN(ResultSRAM_WEN),   // 寫使能信號（低電平有效）
+.A(ResultSRAM_A),       // 14位地址輸入
+.D(ResultSRAM_D)        // 8位數據輸入
+);
+
+// ================= 狀態機時序邏輯 =================
+// 在時鐘上升沿更新狀態，重置時回到IDLE狀態
+always @(posedge CLK) begin
+if (RST) begin
+current_state <= IDLE;
+end else begin
+current_state <= next_state;
+end
+end
+
+// ================= 狀態機組合邏輯 =================
+// 根據當前狀態和條件決定下一個狀態
+always @(*) begin
+next_state = current_state;         // 默認保持當前狀態
+
+```
+case (current_state)
+    IDLE: begin
+        // 空閒狀態，等待重置信號釋放後開始處理
+        if (!RST)
+            next_state = LOAD_PIXELS;
+    end
+    
+    LOAD_PIXELS: begin
+        // 像素讀取狀態，讀取完16個像素後進入水平插值
+        if (load_counter == 5'd15)
+            next_state = CALC_HORZ;
+    end
+    
+    CALC_HORZ: begin
+        // 水平插值狀態，完成4行插值後進入垂直插值
+        if (calc_counter == 3'd3)
+            next_state = CALC_VERT;
+    end
+    
+    CALC_VERT: begin
+        // 垂直插值狀態，一個週期完成後寫入結果
+        next_state = WRITE_RESULT;
+    end
+    
+    WRITE_RESULT: begin
+        // 結果寫入狀態，寫完所有像素後結束，否則處理下一個像素
+        if (output_counter == total_outputs - 1)
+            next_state = DONE_STATE;
+        else
+            next_state = LOAD_PIXELS;
+    end
+    
+    DONE_STATE: begin
+        // 完成狀態，一個週期後回到空閒狀態
+        next_state = IDLE;
+    end
+    
+    default: 
+        next_state = IDLE;          // 異常狀態回到IDLE
+endcase
+```
+
+end
+
+// ================= 主要控制邏輯（時序邏輯） =================
+always @(posedge CLK) begin
+if (RST) begin
+// ========== 重置時初始化所有信號 ==========
+load_counter <= 5’d0;
+calc_counter <= 3’d0;
+output_counter <= 16’d0;
+output_x <= 6’d0;
+output_y <= 6’d0;
+DONE <= 1’b0;
+
+```
+    // 記憶體介面初始化（禁用狀態）
+    ImgROM_CEN <= 1'b1;         // 禁用ROM
+    ResultSRAM_CEN <= 1'b1;     // 禁用SRAM
+    ResultSRAM_WEN <= 1'b1;     // 禁用寫入
+    
+end else begin
+    case (current_state)
+        
+        // ========== IDLE狀態：初始化處理 ==========
+        IDLE: begin
+            load_counter <= 5'd0;
+            calc_counter <= 3'd0;
+            output_counter <= 16'd0;
+            output_x <= 6'd0;
+            output_y <= 6'd0;
+            DONE <= 1'b0;
+            
+            // 禁用所有記憶體操作
+            ImgROM_CEN <= 1'b1;
+            ResultSRAM_CEN <= 1'b1;
+            ResultSRAM_WEN <= 1'b1;
+        end
+        
+        // ========== LOAD_PIXELS狀態：讀取4x4像素區塊 ==========
+        LOAD_PIXELS: begin
+            ImgROM_CEN <= 1'b0;         // 啟用ROM讀取
+            
+            if (load_counter < 5'd15) begin
+                // 計算當前讀取像素在4x4區域中的位置
+                buf_row = load_counter[3:2];    // 行索引（0-3）
+                buf_col = load_counter[1:0];    // 列索引（0-3）
+                
+                // 計算ROM地址：以src_x_int,src_y_int為中心的4x4區域
+                // 地址 = (行座標) * 100 + (列座標)
+                ImgROM_A <= (src_y_int - 1 + buf_row) * 100 + (src_x_int - 1 + buf_col);
+                load_counter <= load_counter + 1;
+            end
+            
+            // 存儲上一週期讀取的像素數據
+            // 注意：ROM有一個週期的讀取延遲
+            if (load_counter > 0) begin
+                pixel_buffer[load_counter - 1] <= ImgROM_Q;
+            end
+        end
+        
+        // ========== CALC_HORZ狀態：水平方向插值計算 ==========
+        CALC_HORZ: begin
+            ImgROM_CEN <= 1'b1;         // 禁用ROM
+            
+            // 為當前行設置四個插值控制點
+            // 每行4個像素：p(-1), p(0), p(1), p(2)
+            p_m1 = pixel_buffer[calc_counter * 4 + 0];  // 第1個像素作為p(-1)
+            p_0  = pixel_buffer[calc_counter * 4 + 1];  // 第2個像素作為p(0)
+            p_1  = pixel_buffer[calc_counter * 4 + 2];  // 第3個像素作為p(1)
+            p_2  = pixel_buffer[calc_counter * 4 + 3];  // 第4個像素作為p(2)
+            frac = frac_x;                              // 使用水平方向小數部分
+            
+            // 存儲當前行的水平插值結果
+            horz_results[calc_counter] <= clamp_round(interp_result);
+            
+            // 處理下一行，或結束水平插值
+            if (calc_counter < 3'd3) begin
+                calc_counter <= calc_counter + 1;
+            end else begin
+                calc_counter <= 3'd0;       // 重置計數器供下次使用
+            end
+        end
+        
+        // ========== CALC_VERT狀態：垂直方向插值計算 ==========
+        CALC_VERT: begin
+            // 使用4個水平插值結果進行垂直插值
+            p_m1 = horz_results[0];         // 第1行結果作為p(-1)
+            p_0  = horz_results[1];         // 第2行結果作為p(0) 
+            p_1  = horz_results[2];         // 第3行結果作為p(1)
+            p_2  = horz_results[3];         // 第4行結果作為p(2)
+            frac = frac_y;                  // 使用垂直方向小數部分
+            
+            // interp_result在下一個週期可用
+        end
+        
+        // ========== WRITE_RESULT狀態：寫入最終結果 ==========
+        WRITE_RESULT: begin
+            // 啟用SRAM寫入操作
+            ResultSRAM_CEN <= 1'b0;
+            ResultSRAM_WEN <= 1'b0;
+            ResultSRAM_A <= output_counter;                    // 順序寫入地址
+            ResultSRAM_D <= clamp_round(interp_result);        // 寫入插值結果
+            
+            // 更新輸出座標（按行掃描順序）
+            if (output_x == TW - 1) begin
+                output_x <= 6'd0;           // 換行：X座標歸零
+                output_y <= output_y + 1;   // Y座標遞增
+            end else begin
+                output_x <= output_x + 1;   // 同行：X座標遞增
+            end
+            
+            output_counter <= output_counter + 1;  // 總輸出計數器遞增
+        end
+        
+        // ========== DONE_STATE狀態：處理完成 ==========
+        DONE_STATE: begin
+            DONE <= 1'b1;              // 拉高完成信號一個週期
+            
+            // 禁用所有記憶體操作
+            ResultSRAM_CEN <= 1'b1;
+            ResultSRAM_WEN <= 1'b1;
+        end
+        
+        default: begin
+            // 異常狀態處理：禁用所有操作
+            ImgROM_CEN <= 1'b1;
+            ResultSRAM_CEN <= 1'b1;
+            ResultSRAM_WEN <= 1'b1;
+        end
+    endcase
+end
+```
+
+end
+
+endmodule
+
+
+
+
